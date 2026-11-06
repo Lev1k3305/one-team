@@ -24,6 +24,7 @@ import { AuthScreen } from './components/auth/AuthScreen';
 import { WorkspaceSetupModal } from './components/workspace/WorkspaceSetupModal';
 import { WorkspaceSwitcher } from './components/workspace/WorkspaceSwitcher';
 import { isSupabaseConfigured } from './services/supabaseClient';
+import { setupNativeDeepLinks } from './services/native/deepLinkService';
 import {
   LayoutDashboard,
   KanbanSquare,
@@ -224,6 +225,10 @@ const RootNavigator: React.FC = () => {
 };
 
 export default function App() {
+  useEffect(() => {
+    setupNativeDeepLinks();
+  }, []);
+
   return (
     <AuthProvider>
       <RootNavigator />

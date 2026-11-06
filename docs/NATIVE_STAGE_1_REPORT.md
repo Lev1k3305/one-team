@@ -137,13 +137,15 @@ if (!Capacitor.isNativePlatform() && 'serviceWorker' in navigator && process.env
   - `dist/assets/index-C8vQU3pV.js` (906.01 kB)
 - Ассеты и конфигурация успешно синхронизированы в `android/` и `ios/`.
 
-### 3.4 Android Debug Build
-- Команда: `cd android && ./gradlew assembleDebug`
+### 3.4 Android Debug Build & Tests
+- Команда сборки: `cd android && ./gradlew assembleDebug`
 - Настройки сети Gradle: добавлен флаг `-Djava.net.preferIPv4Stack=true` в `android/gradle.properties` для стабильной загрузки артефактов в среде Linux.
 - Статус сборки: **BUILD SUCCESSFUL (123 actionable tasks: 118 executed, 5 up-to-date)**.
 - **Путь к собранному APK:**
   `android/app/build/outputs/apk/debug/app-debug.apk`
 - Размер APK: **9.0 MB**
+- **Android Unit Tests:** Команда `./gradlew testDebugUnitTest` успешно выполнена (**BUILD SUCCESSFUL**, 69 tasks, package `kz.oneteam.app`).
+- **Android Instrumented Tests:** `ExampleInstrumentedTest.java` обновлён: package `kz.oneteam.app`, проверка `assertEquals("kz.oneteam.app", appContext.getPackageName())`. Тестовый APK `app-debug-androidTest.apk` успешно собран. Запуск нативного прогона на эмуляторе/устройстве (`./gradlew connectedAndroidTest`) требует физически подключённого Android устройства или запущенного AVD эмулятора (`adb devices` в Linux sandbox вернул пустой список устройств).
 
 ### 3.5 Статус сборки под iOS
 - **Ограничение среды:** Текущее рабочее окружение развёрнуто на базе Linux x86_64 (`Ubuntu 24.04 LTS`).

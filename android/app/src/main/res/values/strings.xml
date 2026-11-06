@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">ONE TEAM</string>
+    <string name="title_activity_main">ONE TEAM</string>
+    <string name="package_name">kz.oneteam.app</string>
+    <string name="custom_url_scheme">kz.oneteam.app</string>
+</resources>

@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, ReactNode, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, ReactNode, useCallback, useRef } from 'react';
 import {
   PageId,
   Task,
@@ -7,7 +7,6 @@ import {
   WorkspaceSettings,
   NotificationItem,
   TaskStatus,
-  Priority,
   ThemeMode,
   Client,
   Transaction,
@@ -20,11 +19,12 @@ import {
   StrategicPriority,
   DevelopmentPlanItem,
 } from '../types';
-import { storageService } from '../services/storage';
+import { storageServiceAdapter } from '../services/storageAdapter';
 import { useAuth } from './AuthContext';
 import { cloudDataService } from '../services/cloudDataService';
+import { sessionGenerationManager } from '../services/storageContext';
 
-interface AppContextType {
+export interface AppContextType {
   // Navigation
   activePage: PageId;
   setActivePage: (page: PageId) => void;
@@ -34,6 +34,9 @@ interface AppContextType {
   // Search & Global Filter
   globalSearch: string;
   setGlobalSearch: (q: string) => void;
+
+  // Storage Readiness
+  isStorageReady: boolean;
 
   // Tasks
   tasks: Task[];
@@ -168,7 +171,7 @@ interface AppContextType {
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  const { currentWorkspace, user, profile } = useAuth();
+  const { currentWorkspace, user, profile, isStorageReady, storageContext, sessionGeneration } = useAuth();
 
   const [activePage, setActivePage] = useState<PageId>('dashboard');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
@@ -194,51 +197,58 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const [globalSearch, setGlobalSearch] = useState('');
 
-  // Domain data
-  const [tasks, setTasks] = useState<Task[]>(() => storageService.getTasks());
-  const [projects, setProjects] = useState<Project[]>(() => storageService.getProjects());
-  const [members, setMembers] = useState<TeamMember[]>(() => storageService.getMembers());
-  const [clients, setClients] = useState<Client[]>(() => storageService.getClients());
-  const [transactions, setTransactions] = useState<Transaction[]>(() =>
-    storageService.getTransactions()
-  );
-  const [settings, setSettings] = useState<WorkspaceSettings>(() => storageService.getSettings());
+  // Domain data - initialized clean; populated when isStorageReady === true
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [members, setMembers] = useState<TeamMember[]>([]);
+  const [clients, setClients] = useState<Client[]>([]);
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [settings, setSettings] = useState<WorkspaceSettings>(() => storageServiceAdapter.getSettings());
   const [currency, setCurrency] = useState<Currency>(() => settings.defaultCurrency || 'KZT');
-  const [notifications, setNotifications] = useState<NotificationItem[]>(() =>
-    storageService.getNotifications()
-  );
+  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
 
   // Strategy data
-  const [mission, setMission] = useState<TeamMission>(() => storageService.getStrategyMission());
-  const [vision, setVision] = useState<TeamVision>(() => storageService.getStrategyVision());
-  const [goals, setGoals] = useState<StrategicGoal[]>(() => storageService.getStrategicGoals());
-  const [priorities, setPriorities] = useState<StrategicPriority[]>(() =>
-    storageService.getStrategicPriorities()
-  );
-  const [developmentPlan, setDevelopmentPlan] = useState<DevelopmentPlanItem[]>(() =>
-    storageService.getDevelopmentPlan()
-  );
+  const [mission, setMission] = useState<TeamMission>(() => storageServiceAdapter.getStrategyMission());
+  const [vision, setVision] = useState<TeamVision>(() => storageServiceAdapter.getStrategyVision());
+  const [goals, setGoals] = useState<StrategicGoal[]>([]);
+  const [priorities, setPriorities] = useState<StrategicPriority[]>([]);
+  const [developmentPlan, setDevelopmentPlan] = useState<DevelopmentPlanItem[]>([]);
 
-  // Synchronize when currentWorkspace changes (Zero data leakage across workspaces)
+  // Synchronize state when storage becomes ready or context changes
   useEffect(() => {
-    const targetWorkspaceId = currentWorkspace?.id;
-    if (!targetWorkspaceId) return;
+    // If storage is not ready or user is guest without workspace, isolate and clear state
+    if (!isStorageReady || storageContext.isGuest || !currentWorkspace?.id) {
+      setTasks([]);
+      setProjects([]);
+      setClients([]);
+      setTransactions([]);
+      setGoals([]);
+      setPriorities([]);
+      setDevelopmentPlan([]);
+      setMembers([]);
+      setNotifications([]);
+      return;
+    }
 
-    let isCancelled = false;
+    const currentGen = sessionGeneration;
+    const targetWorkspaceId = currentWorkspace.id;
 
-    // Immediately reset domain collections to prevent stale data display from previous workspace
-    setTasks([]);
-    setProjects([]);
-    setClients([]);
-    setTransactions([]);
-    setGoals([]);
-    setPriorities([]);
-    setDevelopmentPlan([]);
-    setMembers([]);
+    // Hydrate domain collections from StorageServiceAdapter (100% locally isolated cache)
+    setTasks(storageServiceAdapter.getTasks());
+    setProjects(storageServiceAdapter.getProjects());
+    setClients(storageServiceAdapter.getClients());
+    setTransactions(storageServiceAdapter.getTransactions());
+    setGoals(storageServiceAdapter.getStrategicGoals());
+    setPriorities(storageServiceAdapter.getStrategicPriorities());
+    setDevelopmentPlan(storageServiceAdapter.getDevelopmentPlan());
+    setMembers(storageServiceAdapter.getMembers());
+    setNotifications(storageServiceAdapter.getNotifications());
+    setMission(storageServiceAdapter.getStrategyMission());
+    setVision(storageServiceAdapter.getStrategyVision());
 
-    // Update workspace settings
-    setSettings((prev) => ({
-      ...prev,
+    const latestSettings = storageServiceAdapter.getSettings();
+    setSettings({
+      ...latestSettings,
       workspaceName: currentWorkspace.name,
       workspaceDescription: currentWorkspace.description,
       workspaceAvatar: currentWorkspace.avatar,
@@ -251,30 +261,35 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             role: 'owner',
             avatar: profile.avatarUrl || '',
           }
-        : prev.currentUser,
-    }));
+        : latestSettings.currentUser,
+    });
+
+    let isCancelled = false;
 
     // Asynchronously fetch cloud data with race condition protection
     cloudDataService.loadWorkspaceData(targetWorkspaceId).then((data) => {
-      if (isCancelled) return;
+      // Guard against race conditions: abort if context changed or session generation advanced
+      if (isCancelled || sessionGenerationManager.getGeneration() !== currentGen) {
+        return;
+      }
       if (data) {
-        setTasks(data.tasks || []);
-        setProjects(data.projects || []);
-        setClients(data.clients || []);
-        setTransactions(data.transactions || []);
-        setGoals(data.goals || []);
-        setPriorities(data.priorities || []);
-        setDevelopmentPlan(data.plans || []);
+        if (data.tasks) setTasks(data.tasks);
+        if (data.projects) setProjects(data.projects);
+        if (data.clients) setClients(data.clients);
+        if (data.transactions) setTransactions(data.transactions);
+        if (data.goals) setGoals(data.goals);
+        if (data.priorities) setPriorities(data.priorities);
+        if (data.plans) setDevelopmentPlan(data.plans);
         if (data.mission) setMission(data.mission);
         if (data.vision) setVision(data.vision);
-        setMembers(data.members || []);
+        if (data.members) setMembers(data.members);
       }
     });
 
     return () => {
       isCancelled = true;
     };
-  }, [currentWorkspace?.id, profile]);
+  }, [isStorageReady, currentWorkspace?.id, profile, sessionGeneration, storageContext.isGuest]);
 
   // Modals & Panels
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
@@ -419,19 +434,20 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   }, [settings.theme]);
 
   const refreshData = () => {
-    setTasks(storageService.getTasks());
-    setProjects(storageService.getProjects());
-    setMembers(storageService.getMembers());
-    setClients(storageService.getClients());
-    setTransactions(storageService.getTransactions());
-    setSettings(storageService.getSettings());
-    setNotifications(storageService.getNotifications());
+    if (!isStorageReady) return;
+    setTasks(storageServiceAdapter.getTasks());
+    setProjects(storageServiceAdapter.getProjects());
+    setMembers(storageServiceAdapter.getMembers());
+    setClients(storageServiceAdapter.getClients());
+    setTransactions(storageServiceAdapter.getTransactions());
+    setSettings(storageServiceAdapter.getSettings());
+    setNotifications(storageServiceAdapter.getNotifications());
   };
 
   // Task Actions
   const saveTask = (taskData: Omit<Task, 'id' | 'createdAt' | 'updatedAt'> & { id?: string }) => {
-    const saved = storageService.saveTask(taskData);
-    setTasks(storageService.getTasks());
+    const saved = storageServiceAdapter.saveTask(taskData);
+    setTasks(storageServiceAdapter.getTasks());
     if (currentWorkspace?.id) {
       cloudDataService.syncTask(currentWorkspace.id, saved);
     }
@@ -439,8 +455,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const deleteTask = (taskId: string) => {
-    storageService.deleteTask(taskId);
-    setTasks(storageService.getTasks());
+    storageServiceAdapter.deleteTask(taskId);
+    setTasks(storageServiceAdapter.getTasks());
     if (selectedTaskId === taskId) {
       setSelectedTaskId(null);
     }
@@ -450,16 +466,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const updateTaskStatus = (taskId: string, status: TaskStatus) => {
-    const updated = storageService.updateTaskStatus(taskId, status);
-    setTasks(storageService.getTasks());
+    const updated = storageServiceAdapter.updateTaskStatus(taskId, status);
+    setTasks(storageServiceAdapter.getTasks());
     if (updated && currentWorkspace?.id) {
       cloudDataService.syncTask(currentWorkspace.id, updated);
     }
   };
 
   const toggleTaskCompletion = (taskId: string) => {
-    const updated = storageService.toggleTaskCompletion(taskId);
-    setTasks(storageService.getTasks());
+    const updated = storageServiceAdapter.toggleTaskCompletion(taskId);
+    setTasks(storageServiceAdapter.getTasks());
     if (updated && currentWorkspace?.id) {
       cloudDataService.syncTask(currentWorkspace.id, updated);
     }
@@ -467,11 +483,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const addTaskComment = (taskId: string, text: string) => {
     if (!text.trim()) return;
-    storageService.addTaskComment(taskId, text, {
+    storageServiceAdapter.addTaskComment(taskId, text, {
       name: settings.currentUser.name,
       avatar: settings.currentUser.avatar,
     });
-    const latestTasks = storageService.getTasks();
+    const latestTasks = storageServiceAdapter.getTasks();
     setTasks(latestTasks);
     const updated = latestTasks.find((t) => t.id === taskId);
     if (updated && currentWorkspace?.id) {
@@ -514,8 +530,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   // Project Actions
   const saveProject = (projData: Omit<Project, 'id' | 'createdAt'> & { id?: string }) => {
-    const saved = storageService.saveProject(projData);
-    setProjects(storageService.getProjects());
+    const saved = storageServiceAdapter.saveProject(projData);
+    setProjects(storageServiceAdapter.getProjects());
     if (currentWorkspace?.id) {
       cloudDataService.syncProject(currentWorkspace.id, saved);
     }
@@ -523,8 +539,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const deleteProject = (projectId: string) => {
-    storageService.deleteProject(projectId);
-    setProjects(storageService.getProjects());
+    storageServiceAdapter.deleteProject(projectId);
+    setProjects(storageServiceAdapter.getProjects());
     if (selectedProjectId === projectId) {
       setSelectedProjectId(null);
     }
@@ -534,8 +550,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const toggleArchiveProject = (projectId: string) => {
-    const updated = storageService.toggleArchiveProject(projectId);
-    setProjects(storageService.getProjects());
+    const updated = storageServiceAdapter.toggleArchiveProject(projectId);
+    setProjects(storageServiceAdapter.getProjects());
     if (updated && currentWorkspace?.id) {
       cloudDataService.syncProject(currentWorkspace.id, updated);
     }
@@ -558,14 +574,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   // Member Actions
   const saveMember = (memberData: Omit<TeamMember, 'id'> & { id?: string }) => {
-    const saved = storageService.saveMember(memberData);
-    setMembers(storageService.getMembers());
+    const saved = storageServiceAdapter.saveMember(memberData);
+    setMembers(storageServiceAdapter.getMembers());
     return saved;
   };
 
   const deleteMember = (memberId: string) => {
-    storageService.deleteMember(memberId);
-    setMembers(storageService.getMembers());
+    storageServiceAdapter.deleteMember(memberId);
+    setMembers(storageServiceAdapter.getMembers());
     if (selectedMemberId === memberId) {
       setSelectedMemberId(null);
     }
@@ -573,8 +589,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   // Client Actions
   const saveClient = (clientData: Omit<Client, 'id' | 'createdAt'> & { id?: string }) => {
-    const saved = storageService.saveClient(clientData);
-    setClients(storageService.getClients());
+    const saved = storageServiceAdapter.saveClient(clientData);
+    setClients(storageServiceAdapter.getClients());
     if (currentWorkspace?.id) {
       cloudDataService.syncClient(currentWorkspace.id, saved);
     }
@@ -582,8 +598,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const deleteClient = (clientId: string) => {
-    storageService.deleteClient(clientId);
-    setClients(storageService.getClients());
+    storageServiceAdapter.deleteClient(clientId);
+    setClients(storageServiceAdapter.getClients());
     if (selectedClientId === clientId) {
       setSelectedClientId(null);
     }
@@ -593,8 +609,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const toggleArchiveClient = (clientId: string) => {
-    const updated = storageService.toggleArchiveClient(clientId);
-    setClients(storageService.getClients());
+    const updated = storageServiceAdapter.toggleArchiveClient(clientId);
+    setClients(storageServiceAdapter.getClients());
     if (updated && currentWorkspace?.id) {
       cloudDataService.syncClient(currentWorkspace.id, updated);
     }
@@ -616,8 +632,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const addClientNote = (clientId: string, text: string) => {
-    storageService.addClientNote(clientId, text, settings.currentUser.name);
-    const latestClients = storageService.getClients();
+    storageServiceAdapter.addClientNote(clientId, text, settings.currentUser.name);
+    const latestClients = storageServiceAdapter.getClients();
     setClients(latestClients);
     const updated = latestClients.find((c) => c.id === clientId);
     if (updated && currentWorkspace?.id) {
@@ -629,8 +645,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     clientId: string,
     interaction: Omit<ClientInteraction, 'id'>
   ) => {
-    storageService.addClientInteraction(clientId, interaction);
-    const latestClients = storageService.getClients();
+    storageServiceAdapter.addClientInteraction(clientId, interaction);
+    const latestClients = storageServiceAdapter.getClients();
     setClients(latestClients);
     const updated = latestClients.find((c) => c.id === clientId);
     if (updated && currentWorkspace?.id) {
@@ -640,8 +656,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   // Finance Actions
   const saveTransaction = (txData: Omit<Transaction, 'id' | 'createdAt'> & { id?: string }) => {
-    const saved = storageService.saveTransaction(txData);
-    setTransactions(storageService.getTransactions());
+    const saved = storageServiceAdapter.saveTransaction(txData);
+    setTransactions(storageServiceAdapter.getTransactions());
     if (currentWorkspace?.id) {
       cloudDataService.syncTransaction(currentWorkspace.id, saved);
     }
@@ -649,8 +665,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const deleteTransaction = (txId: string) => {
-    storageService.deleteTransaction(txId);
-    setTransactions(storageService.getTransactions());
+    storageServiceAdapter.deleteTransaction(txId);
+    setTransactions(storageServiceAdapter.getTransactions());
     if (currentWorkspace?.id) {
       cloudDataService.deleteTransaction(currentWorkspace.id, txId);
     }
@@ -687,7 +703,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   // Strategy Actions
   const saveMission = (newMission: TeamMission) => {
-    const saved = storageService.saveStrategyMission(newMission);
+    const saved = storageServiceAdapter.saveStrategyMission(newMission);
     setMission(saved);
     if (currentWorkspace?.id) {
       cloudDataService.syncMission(currentWorkspace.id, saved);
@@ -695,7 +711,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const saveVision = (newVision: TeamVision) => {
-    const saved = storageService.saveStrategyVision(newVision);
+    const saved = storageServiceAdapter.saveStrategyVision(newVision);
     setVision(saved);
     if (currentWorkspace?.id) {
       cloudDataService.syncVision(currentWorkspace.id, saved);
@@ -705,8 +721,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const saveGoal = (
     goalData: Omit<StrategicGoal, 'id' | 'createdAt' | 'updatedAt'> & { id?: string }
   ) => {
-    const saved = storageService.saveStrategicGoal(goalData);
-    setGoals(storageService.getStrategicGoals());
+    const saved = storageServiceAdapter.saveStrategicGoal(goalData);
+    setGoals(storageServiceAdapter.getStrategicGoals());
     if (currentWorkspace?.id) {
       cloudDataService.syncGoal(currentWorkspace.id, saved);
     }
@@ -714,8 +730,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const deleteGoal = (goalId: string) => {
-    storageService.deleteStrategicGoal(goalId);
-    setGoals(storageService.getStrategicGoals());
+    storageServiceAdapter.deleteStrategicGoal(goalId);
+    setGoals(storageServiceAdapter.getStrategicGoals());
     if (currentWorkspace?.id) {
       cloudDataService.deleteGoal(currentWorkspace.id, goalId);
     }
@@ -739,8 +755,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const savePriority = (
     priorityData: Omit<StrategicPriority, 'id'> & { id?: string }
   ) => {
-    const saved = storageService.saveStrategicPriority(priorityData);
-    setPriorities(storageService.getStrategicPriorities());
+    const saved = storageServiceAdapter.saveStrategicPriority(priorityData);
+    setPriorities(storageServiceAdapter.getStrategicPriorities());
     if (currentWorkspace?.id) {
       cloudDataService.syncPriority(currentWorkspace.id, saved);
     }
@@ -748,8 +764,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const deletePriority = (priorityId: string) => {
-    storageService.deleteStrategicPriority(priorityId);
-    setPriorities(storageService.getStrategicPriorities());
+    storageServiceAdapter.deleteStrategicPriority(priorityId);
+    setPriorities(storageServiceAdapter.getStrategicPriorities());
     if (currentWorkspace?.id) {
       cloudDataService.deletePriority(currentWorkspace.id, priorityId);
     }
@@ -773,8 +789,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const savePlanItem = (
     itemData: Omit<DevelopmentPlanItem, 'id'> & { id?: string }
   ) => {
-    const saved = storageService.saveDevelopmentPlanItem(itemData);
-    setDevelopmentPlan(storageService.getDevelopmentPlan());
+    const saved = storageServiceAdapter.saveDevelopmentPlanItem(itemData);
+    setDevelopmentPlan(storageServiceAdapter.getDevelopmentPlan());
     if (currentWorkspace?.id) {
       cloudDataService.syncPlanItem(currentWorkspace.id, saved);
     }
@@ -782,8 +798,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const deletePlanItem = (itemId: string) => {
-    storageService.deleteDevelopmentPlanItem(itemId);
-    setDevelopmentPlan(storageService.getDevelopmentPlan());
+    storageServiceAdapter.deleteDevelopmentPlanItem(itemId);
+    setDevelopmentPlan(storageServiceAdapter.getDevelopmentPlan());
     if (currentWorkspace?.id) {
       cloudDataService.deletePlanItem(currentWorkspace.id, itemId);
     }
@@ -806,7 +822,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   // Settings & Theme
   const updateSettings = (newSettings: Partial<WorkspaceSettings>) => {
-    const updated = storageService.updateSettings(newSettings);
+    const updated = storageServiceAdapter.updateSettings(newSettings);
     setSettings(updated);
     if (currentWorkspace?.id) {
       cloudDataService.syncSettings(currentWorkspace.id, updated);
@@ -819,18 +835,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   // Notifications
   const markNotificationRead = (id: string) => {
-    storageService.markNotificationRead(id);
-    setNotifications(storageService.getNotifications());
+    storageServiceAdapter.markNotificationRead(id);
+    setNotifications(storageServiceAdapter.getNotifications());
   };
 
   const markAllNotificationsRead = () => {
-    storageService.markAllNotificationsRead();
-    setNotifications(storageService.getNotifications());
+    storageServiceAdapter.markAllNotificationsRead();
+    setNotifications(storageServiceAdapter.getNotifications());
   };
 
   const deleteNotification = (id: string) => {
-    storageService.deleteNotification(id);
-    setNotifications(storageService.getNotifications());
+    storageServiceAdapter.deleteNotification(id);
+    setNotifications(storageServiceAdapter.getNotifications());
   };
 
   const getProjectById = (id: string) => enrichedProjects.find((p) => p.id === id);
@@ -847,6 +863,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         setSidebarCollapsed,
         globalSearch,
         setGlobalSearch,
+        isStorageReady,
         tasks: enrichedTasks,
         saveTask,
         deleteTask,

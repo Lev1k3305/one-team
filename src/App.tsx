@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { AuthProvider, useAuth } from './context/AuthContext';
+import { SyncProvider } from './context/SyncContext';
 import { AppProvider, useApp } from './context/AppContext';
 import { reminderService } from './services/reminderService';
 import { Sidebar } from './components/layout/Sidebar';
@@ -218,9 +219,11 @@ const RootNavigator: React.FC = () => {
   }
 
   return (
-    <AppProvider>
-      <MainLayout />
-    </AppProvider>
+    <SyncProvider>
+      <AppProvider>
+        <MainLayout />
+      </AppProvider>
+    </SyncProvider>
   );
 };
 

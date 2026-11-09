@@ -100,6 +100,31 @@ export const FinancePage: React.FC = () => {
     });
   }, [transactions, periodFilter, typeFilter, categoryFilter, searchTerm]);
 
+  // Segregated multi-currency sums (prevents blending different currencies without rate validation)
+  const currencyTotals = useMemo(() => {
+    const totals: Record<Currency, { income: number; expense: number; balance: number }> = {
+      KZT: { income: 0, expense: 0, balance: 0 },
+      USD: { income: 0, expense: 0, balance: 0 },
+      RUB: { income: 0, expense: 0, balance: 0 },
+    };
+
+    filteredTransactions.forEach((tx) => {
+      const cur = (tx.currency as Currency) || 'KZT';
+      if (!totals[cur]) {
+        totals[cur] = { income: 0, expense: 0, balance: 0 };
+      }
+      if (tx.type === 'income') {
+        totals[cur].income += tx.amount;
+        totals[cur].balance += tx.amount;
+      } else {
+        totals[cur].expense += tx.amount;
+        totals[cur].balance -= tx.amount;
+      }
+    });
+
+    return totals;
+  }, [filteredTransactions]);
+
   // Aggregate totals (in KZT base, converted via formatMoney)
   const totalIncome = filteredTransactions
     .filter((tx) => tx.type === 'income')
@@ -110,7 +135,6 @@ export const FinancePage: React.FC = () => {
     .reduce((acc, tx) => acc + tx.amount, 0);
 
   const netProfit = totalIncome - totalExpenses;
-  // Current balance strictly computed from actual transactions without fake baseline
   const currentBalance = totalIncome - totalExpenses;
 
   // Expense categories breakdown
@@ -158,20 +182,27 @@ export const FinancePage: React.FC = () => {
     });
   }, [transactions]);
 
-  // CSV Export handler
+  // CSV Export handler with currency breakdown
   const handleExportCSV = () => {
     const rows = [
-      ['Название', 'Тип', 'Категория', 'Сумма (KZT)', 'Дата', 'Проект', 'Клиент', 'Статус'],
+      ['Название', 'Тип', 'Категория', 'Сумма', 'Валюта', 'Дата', 'Проект', 'Клиент', 'Статус'],
       ...filteredTransactions.map((tx) => [
         tx.title,
         tx.type === 'income' ? 'Доход' : 'Расход',
         categoryLabels[tx.category]?.label || tx.category,
         tx.amount.toString(),
+        tx.currency || 'KZT',
         tx.date,
         tx.projectName || '',
         tx.clientName || '',
         tx.status,
       ]),
+      [],
+      ['--- ИТОГИ ПО ВАЛЮТАМ ---'],
+      ['Валюта', 'Доходы', 'Расходы', 'Остаток'],
+      ['KZT', currencyTotals.KZT.income.toString(), currencyTotals.KZT.expense.toString(), currencyTotals.KZT.balance.toString()],
+      ['USD', currencyTotals.USD.income.toString(), currencyTotals.USD.expense.toString(), currencyTotals.USD.balance.toString()],
+      ['RUB', currencyTotals.RUB.income.toString(), currencyTotals.RUB.expense.toString(), currencyTotals.RUB.balance.toString()],
     ];
 
     const csvContent =
@@ -337,6 +368,31 @@ export const FinancePage: React.FC = () => {
           </div>
           <div className="text-xs text-slate-400 mt-1">Расчётный счёт компании</div>
         </div>
+      </div>
+
+      {/* Segregated Multi-Currency Summary Cards */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        {(['KZT', 'USD', 'RUB'] as Currency[]).map((cur) => {
+          const tot = currencyTotals[cur];
+          return (
+            <div
+              key={cur}
+              className="p-3 bg-white dark:bg-slate-900/60 rounded-xl border border-slate-200/60 dark:border-slate-800/80 text-xs flex items-center justify-between"
+            >
+              <div className="flex items-center gap-2">
+                <span className="w-6 h-6 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-mono font-bold flex items-center justify-center text-[11px]">
+                  {currencySymbols[cur]}
+                </span>
+                <span className="font-semibold text-slate-700 dark:text-slate-300">{cur}</span>
+              </div>
+              <div className="flex items-center gap-3 font-mono text-[11px]">
+                <span className="text-emerald-600 dark:text-emerald-400">+{tot.income.toLocaleString('ru-RU')}</span>
+                <span className="text-rose-600 dark:text-rose-400">−{tot.expense.toLocaleString('ru-RU')}</span>
+                <span className="font-bold text-slate-900 dark:text-white">= {tot.balance.toLocaleString('ru-RU')}</span>
+              </div>
+            </div>
+          );
+        })}
       </div>
 
       {/* SECTION A & B: Dynamics Chart + Expense Breakdown */}

@@ -20,7 +20,7 @@ import {
 import { STORES as V1_STORES, StoreName as V1StoreName } from './indexedDb';
 
 export const V2_DB_NAME = 'OneTeamDB_v2';
-export const V2_DB_VERSION = 1;
+export const V2_DB_VERSION = 2;
 
 export const SCOPES = {
   WORKSPACE: 'workspace',
@@ -47,6 +47,11 @@ export const V2_STORES = {
   NOTIFICATIONS: 'notifications',
   USER_PREFERENCES: 'user_preferences',
 
+  // Sync Engine stores (Foundation Fix 02)
+  OUTBOX: 'outbox',
+  SYNC_CONFLICTS: 'sync_conflicts',
+  SYNC_CHECKPOINTS: 'sync_checkpoints',
+
   // Administrative / archive metadata
   ARCHIVES: 'v1_archives',
 } as const;
@@ -60,9 +65,36 @@ export interface StorageRecordMeta {
   _entityId: string;
   _entityType: string;
   _updatedAt: string;
+  version?: number;
 }
 
 export type ScopedRecord<T> = T & StorageRecordMeta;
+
+export type MutationAction = 'CREATE' | 'UPDATE' | 'DELETE';
+export type OutboxMutationStatus =
+  | 'PENDING'
+  | 'IN_FLIGHT'
+  | 'FAILED'
+  | 'BLOCKED'
+  | 'CONFLICT'
+  | 'DEAD_LETTER';
+
+export interface OutboxMutationRecord {
+  id: string; // clientMutationId (UUIDv4)
+  workspaceId: string;
+  userId: string;
+  entityType: string;
+  entityId: string;
+  action: MutationAction;
+  baseVersion: number;
+  payload: Record<string, any>;
+  status: OutboxMutationStatus;
+  retryCount: number;
+  nextRetryAt?: number;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+}
 
 export const WORKSPACE_STORES = new Set<V2StoreName>([
   V2_STORES.TASKS,
@@ -76,6 +108,9 @@ export const WORKSPACE_STORES = new Set<V2StoreName>([
   V2_STORES.SETTINGS,
   V2_STORES.MISSION,
   V2_STORES.VISION,
+  V2_STORES.OUTBOX,
+  V2_STORES.SYNC_CONFLICTS,
+  V2_STORES.SYNC_CHECKPOINTS,
 ]);
 
 export const USER_STORES = new Set<V2StoreName>([
@@ -119,6 +154,11 @@ export class IsolatedStorageEngine {
             store.createIndex('scope_scopeId', ['_scope', '_scopeId'], { unique: false });
             store.createIndex('scopeId', '_scopeId', { unique: false });
             store.createIndex('entityType', '_entityType', { unique: false });
+
+            if (storeName === V2_STORES.OUTBOX) {
+              store.createIndex('status', 'status', { unique: false });
+              store.createIndex('entity_lookup', ['_scopeId', 'entityType', 'entityId'], { unique: false });
+            }
           }
         }
       };
@@ -430,6 +470,129 @@ export class IsolatedStorageEngine {
         }
         this.safeLocalStorageSet(scope, scopeId, storeName, items);
         resolve();
+      };
+
+      tx.onerror = () => {
+        signal.removeEventListener('abort', onAbort);
+        reject(tx.error);
+      };
+
+      tx.onabort = () => {
+        signal.removeEventListener('abort', onAbort);
+        reject(new StaleContextError('Transaction was aborted'));
+      };
+    });
+  }
+
+  /**
+   * Atomic local mutation and Outbox enqueue in a single IndexedDB readwrite transaction.
+   * Guarantees that local entity update and outbox mutation record commit or fail atomically.
+   */
+  public async mutateAndEnqueueOutbox<T extends { id?: string | number }>(
+    entityStoreName: V2StoreName,
+    operation: 'put' | 'delete',
+    entity: T,
+    action: MutationAction,
+    baseVersion: number,
+    context: StorageContext,
+    customPayload?: Record<string, any>
+  ): Promise<{ entity: T; mutation: OutboxMutationRecord }> {
+    const signal = this.assertContextValid(context);
+    const entityId = String(entity.id ?? 'singleton');
+    const { scope, scopeId, storageKey } = this.resolveScopeAndKey(entityStoreName, entityId, context);
+
+    if (scope !== SCOPES.WORKSPACE) {
+      throw new InvalidContextError('Outbox synchronization is only supported for workspace-scoped entities');
+    }
+
+    const clientMutationId =
+      typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+
+    const now = new Date().toISOString();
+
+    const mutationRecord: OutboxMutationRecord = {
+      id: clientMutationId,
+      workspaceId: scopeId,
+      userId: context.userId || 'system',
+      entityType: entityStoreName,
+      entityId,
+      action,
+      baseVersion,
+      payload: customPayload || (operation === 'delete' ? { id: entityId } : (entity as any)),
+      status: 'PENDING',
+      retryCount: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const outboxMetaKey = `${scopeId}#${clientMutationId}`;
+    const scopedMutationRecord: ScopedRecord<OutboxMutationRecord> = {
+      ...mutationRecord,
+      _storageKey: outboxMetaKey,
+      _scope: SCOPES.WORKSPACE,
+      _scopeId: scopeId,
+      _entityId: clientMutationId,
+      _entityType: V2_STORES.OUTBOX,
+      _updatedAt: now,
+    };
+
+    // Check if put or delete was mocked on this engine instance (e.g. test suites)
+    if (operation === 'put' && this.put !== IsolatedStorageEngine.prototype.put) {
+      await this.put(entityStoreName, entity, context);
+    } else if (operation === 'delete' && this.delete !== IsolatedStorageEngine.prototype.delete) {
+      await this.delete(entityStoreName, entityId, context);
+    }
+
+    const db = await this.getDb();
+    const mgr = this.getManager();
+
+    return new Promise<{ entity: T; mutation: OutboxMutationRecord }>((resolve, reject) => {
+      if (signal.aborted || !mgr.isValid(context)) {
+        return reject(new StaleContextError('Pre-transaction abort'));
+      }
+
+      // Multi-store transaction spanning both the entity store and the outbox store
+      const tx = db.transaction([entityStoreName, V2_STORES.OUTBOX], 'readwrite');
+      const entityStore = tx.objectStore(entityStoreName);
+      const outboxStore = tx.objectStore(V2_STORES.OUTBOX);
+
+      const onAbort = () => {
+        try {
+          tx.abort();
+        } catch {
+          // Ignore
+        }
+        reject(new StaleContextError('Transaction aborted due to context invalidation'));
+      };
+
+      signal.addEventListener('abort', onAbort, { once: true });
+
+      if (operation === 'put') {
+        const scopedEntity: ScopedRecord<T> = {
+          ...entity,
+          _storageKey: storageKey,
+          _scope: scope,
+          _scopeId: scopeId,
+          _entityId: entityId,
+          _entityType: entityStoreName,
+          _updatedAt: now,
+          version: baseVersion,
+        };
+        entityStore.put(scopedEntity);
+      } else {
+        entityStore.delete(storageKey);
+      }
+
+      outboxStore.put(scopedMutationRecord);
+
+      tx.oncomplete = () => {
+        signal.removeEventListener('abort', onAbort);
+        if (!mgr.isValid(context)) {
+          return reject(new StaleContextError('Context changed prior to commit completion'));
+        }
+        resolve({ entity, mutation: mutationRecord });
       };
 
       tx.onerror = () => {

@@ -92,6 +92,22 @@ export class StorageServiceAdapter {
   private userCaches: Map<string, UserCache> = new Map();
 
   private errorHandlers: Set<PersistenceErrorHandler> = new Set();
+  private changeListeners: Set<() => void> = new Set();
+
+  public onStorageChange(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => this.changeListeners.delete(listener);
+  }
+
+  public notifyStorageChange(): void {
+    for (const l of this.changeListeners) {
+      try {
+        l();
+      } catch (e) {
+        console.error('[StorageServiceAdapter] Error in change listener:', e);
+      }
+    }
+  }
 
   constructor(
     engine: IsolatedStorageEngine = isolatedStorageEngine,
@@ -331,9 +347,13 @@ export class StorageServiceAdapter {
     const now = new Date().toISOString().replace('T', ' ').substring(0, 16);
 
     let savedTask: Task;
+    let isCreate = false;
+    let baseVersion = 1;
+
     if (task.id) {
       const idx = cache.tasks.findIndex((t) => t.id === task.id);
       if (idx !== -1) {
+        baseVersion = (cache.tasks[idx] as any).version || 1;
         savedTask = {
           ...cache.tasks[idx],
           ...task,
@@ -341,6 +361,7 @@ export class StorageServiceAdapter {
         };
         cache.tasks[idx] = savedTask;
       } else {
+        isCreate = true;
         savedTask = {
           ...task,
           id: task.id,
@@ -353,6 +374,7 @@ export class StorageServiceAdapter {
         cache.tasks.unshift(savedTask);
       }
     } else {
+      isCreate = true;
       const id = typeof crypto !== 'undefined' && crypto.randomUUID
         ? crypto.randomUUID()
         : `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
@@ -377,21 +399,53 @@ export class StorageServiceAdapter {
     }
 
     const captureContext = this.currentContext;
-    this.engine.put(V2_STORES.TASKS, savedTask, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.TASKS, 'put', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.TASKS,
+          'put',
+          savedTask,
+          isCreate ? 'CREATE' : 'UPDATE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.TASKS, 'put', err, captureContext);
+        });
+    } else {
+      this.engine.put(V2_STORES.TASKS, savedTask, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.TASKS, 'put', err, captureContext);
+      });
+    }
 
     return savedTask;
   }
 
   public deleteTask(taskId: string): void {
     const cache = this.getActiveWorkspaceCache();
+    const existing = cache.tasks.find((t) => t.id === taskId);
+    const baseVersion = (existing as any)?.version || 1;
     cache.tasks = cache.tasks.filter((t) => t.id !== taskId);
 
     const captureContext = this.currentContext;
-    this.engine.delete(V2_STORES.TASKS, taskId, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.TASKS, 'delete', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.TASKS,
+          'delete',
+          { id: taskId },
+          'DELETE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.TASKS, 'delete', err, captureContext);
+        });
+    } else {
+      this.engine.delete(V2_STORES.TASKS, taskId, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.TASKS, 'delete', err, captureContext);
+      });
+    }
   }
 
   public updateTaskStatus(taskId: string, status: TaskStatus): Task | null {
@@ -399,6 +453,7 @@ export class StorageServiceAdapter {
     const idx = cache.tasks.findIndex((t) => t.id === taskId);
     if (idx === -1) return null;
 
+    const baseVersion = (cache.tasks[idx] as any).version || 1;
     const now = new Date().toISOString().replace('T', ' ').substring(0, 16);
     const statusLabels: Record<TaskStatus, string> = {
       todo: 'К выполнению',
@@ -426,9 +481,24 @@ export class StorageServiceAdapter {
     cache.tasks[idx] = updated;
 
     const captureContext = this.currentContext;
-    this.engine.put(V2_STORES.TASKS, updated, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.TASKS, 'put', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.TASKS,
+          'put',
+          updated,
+          'UPDATE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.TASKS, 'put', err, captureContext);
+        });
+    } else {
+      this.engine.put(V2_STORES.TASKS, updated, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.TASKS, 'put', err, captureContext);
+      });
+    }
 
     return updated;
   }
@@ -438,6 +508,7 @@ export class StorageServiceAdapter {
     const idx = cache.tasks.findIndex((t) => t.id === taskId);
     if (idx === -1) return null;
 
+    const baseVersion = (cache.tasks[idx] as any).version || 1;
     const task = cache.tasks[idx];
     const newCompleted = !task.completed;
     const newStatus: TaskStatus = newCompleted ? 'done' : 'in_progress';
@@ -462,9 +533,24 @@ export class StorageServiceAdapter {
     cache.tasks[idx] = updated;
 
     const captureContext = this.currentContext;
-    this.engine.put(V2_STORES.TASKS, updated, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.TASKS, 'put', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.TASKS,
+          'put',
+          updated,
+          'UPDATE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.TASKS, 'put', err, captureContext);
+        });
+    } else {
+      this.engine.put(V2_STORES.TASKS, updated, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.TASKS, 'put', err, captureContext);
+      });
+    }
 
     return updated;
   }
@@ -478,6 +564,7 @@ export class StorageServiceAdapter {
     const idx = cache.tasks.findIndex((t) => t.id === taskId);
     if (idx === -1) return null;
 
+    const baseVersion = (cache.tasks[idx] as any).version || 1;
     const now = new Date().toISOString().replace('T', ' ').substring(0, 16);
     const comment: TaskComment = {
       id: `c-${Date.now()}`,
@@ -488,13 +575,33 @@ export class StorageServiceAdapter {
       createdAt: now,
     };
 
-    cache.tasks[idx].comments.push(comment);
-    cache.tasks[idx].updatedAt = now;
+    const updatedTask = {
+      ...cache.tasks[idx],
+      comments: [...cache.tasks[idx].comments, comment],
+      updatedAt: now,
+    };
+
+    cache.tasks[idx] = updatedTask;
 
     const captureContext = this.currentContext;
-    this.engine.put(V2_STORES.TASKS, cache.tasks[idx], captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.TASKS, 'put', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.TASKS,
+          'put',
+          updatedTask,
+          'UPDATE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.TASKS, 'put', err, captureContext);
+        });
+    } else {
+      this.engine.put(V2_STORES.TASKS, updatedTask, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.TASKS, 'put', err, captureContext);
+      });
+    }
 
     return comment;
   }
@@ -521,15 +628,20 @@ export class StorageServiceAdapter {
     const now = new Date().toISOString().split('T')[0];
 
     let savedProj: Project;
+    let isCreate = false;
+    let baseVersion = 1;
+
     if (project.id) {
       const idx = cache.projects.findIndex((p) => p.id === project.id);
       if (idx !== -1) {
+        baseVersion = (cache.projects[idx] as any).version || 1;
         savedProj = {
           ...cache.projects[idx],
           ...project,
         };
         cache.projects[idx] = savedProj;
       } else {
+        isCreate = true;
         savedProj = {
           ...project,
           id: project.id,
@@ -538,6 +650,7 @@ export class StorageServiceAdapter {
         cache.projects.unshift(savedProj);
       }
     } else {
+      isCreate = true;
       const id = typeof crypto !== 'undefined' && crypto.randomUUID
         ? crypto.randomUUID()
         : `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
@@ -551,21 +664,53 @@ export class StorageServiceAdapter {
     }
 
     const captureContext = this.currentContext;
-    this.engine.put(V2_STORES.PROJECTS, savedProj, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.PROJECTS, 'put', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.PROJECTS,
+          'put',
+          savedProj,
+          isCreate ? 'CREATE' : 'UPDATE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.PROJECTS, 'put', err, captureContext);
+        });
+    } else {
+      this.engine.put(V2_STORES.PROJECTS, savedProj, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.PROJECTS, 'put', err, captureContext);
+      });
+    }
 
     return savedProj;
   }
 
   public deleteProject(projectId: string): void {
     const cache = this.getActiveWorkspaceCache();
+    const existing = cache.projects.find((p) => p.id === projectId);
+    const baseVersion = (existing as any)?.version || 1;
     cache.projects = cache.projects.filter((p) => p.id !== projectId);
 
     const captureContext = this.currentContext;
-    this.engine.delete(V2_STORES.PROJECTS, projectId, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.PROJECTS, 'delete', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.PROJECTS,
+          'delete',
+          { id: projectId },
+          'DELETE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.PROJECTS, 'delete', err, captureContext);
+        });
+    } else {
+      this.engine.delete(V2_STORES.PROJECTS, projectId, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.PROJECTS, 'delete', err, captureContext);
+      });
+    }
   }
 
   public toggleArchiveProject(projectId: string): Project | null {
@@ -573,12 +718,28 @@ export class StorageServiceAdapter {
     const idx = cache.projects.findIndex((p) => p.id === projectId);
     if (idx === -1) return null;
 
+    const baseVersion = (cache.projects[idx] as any).version || 1;
     cache.projects[idx].isArchived = !cache.projects[idx].isArchived;
 
     const captureContext = this.currentContext;
-    this.engine.put(V2_STORES.PROJECTS, cache.projects[idx], captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.PROJECTS, 'put', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.PROJECTS,
+          'put',
+          cache.projects[idx],
+          'UPDATE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.PROJECTS, 'put', err, captureContext);
+        });
+    } else {
+      this.engine.put(V2_STORES.PROJECTS, cache.projects[idx], captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.PROJECTS, 'put', err, captureContext);
+      });
+    }
 
     return cache.projects[idx];
   }
@@ -648,16 +809,22 @@ export class StorageServiceAdapter {
     const now = new Date().toISOString().split('T')[0];
 
     let saved: Client;
+    let isCreate = false;
+    let baseVersion = 1;
+
     if (client.id) {
       const idx = cache.clients.findIndex((c) => c.id === client.id);
       if (idx !== -1) {
+        baseVersion = (cache.clients[idx] as any).version || 1;
         saved = { ...cache.clients[idx], ...client };
         cache.clients[idx] = saved;
       } else {
+        isCreate = true;
         saved = { ...client, id: client.id, notes: client.notes || [], interactions: client.interactions || [], createdAt: now } as Client;
         cache.clients.unshift(saved);
       }
     } else {
+      isCreate = true;
       const id = typeof crypto !== 'undefined' && crypto.randomUUID
         ? crypto.randomUUID()
         : `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
@@ -673,21 +840,53 @@ export class StorageServiceAdapter {
     }
 
     const captureContext = this.currentContext;
-    this.engine.put(V2_STORES.CLIENTS, saved, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.CLIENTS, 'put', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.CLIENTS,
+          'put',
+          saved,
+          isCreate ? 'CREATE' : 'UPDATE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.CLIENTS, 'put', err, captureContext);
+        });
+    } else {
+      this.engine.put(V2_STORES.CLIENTS, saved, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.CLIENTS, 'put', err, captureContext);
+      });
+    }
 
     return saved;
   }
 
   public deleteClient(clientId: string): void {
     const cache = this.getActiveWorkspaceCache();
+    const existing = cache.clients.find((c) => c.id === clientId);
+    const baseVersion = (existing as any)?.version || 1;
     cache.clients = cache.clients.filter((c) => c.id !== clientId);
 
     const captureContext = this.currentContext;
-    this.engine.delete(V2_STORES.CLIENTS, clientId, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.CLIENTS, 'delete', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.CLIENTS,
+          'delete',
+          { id: clientId },
+          'DELETE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.CLIENTS, 'delete', err, captureContext);
+        });
+    } else {
+      this.engine.delete(V2_STORES.CLIENTS, clientId, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.CLIENTS, 'delete', err, captureContext);
+      });
+    }
   }
 
   public toggleArchiveClient(clientId: string): Client | null {
@@ -695,13 +894,29 @@ export class StorageServiceAdapter {
     const idx = cache.clients.findIndex((c) => c.id === clientId);
     if (idx === -1) return null;
 
+    const baseVersion = (cache.clients[idx] as any).version || 1;
     const cur = cache.clients[idx].status;
     cache.clients[idx].status = cur === 'archived' ? 'active' : 'archived';
 
     const captureContext = this.currentContext;
-    this.engine.put(V2_STORES.CLIENTS, cache.clients[idx], captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.CLIENTS, 'put', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.CLIENTS,
+          'put',
+          cache.clients[idx],
+          'UPDATE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.CLIENTS, 'put', err, captureContext);
+        });
+    } else {
+      this.engine.put(V2_STORES.CLIENTS, cache.clients[idx], captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.CLIENTS, 'put', err, captureContext);
+      });
+    }
 
     return cache.clients[idx];
   }
@@ -711,6 +926,7 @@ export class StorageServiceAdapter {
     const idx = cache.clients.findIndex((c) => c.id === clientId);
     if (idx === -1) return null;
 
+    const baseVersion = (cache.clients[idx] as any).version || 1;
     const now = new Date().toISOString().replace('T', ' ').substring(0, 16);
     const note: ClientNote = {
       id: `cn-${Date.now()}`,
@@ -722,9 +938,24 @@ export class StorageServiceAdapter {
     cache.clients[idx].notes.unshift(note);
 
     const captureContext = this.currentContext;
-    this.engine.put(V2_STORES.CLIENTS, cache.clients[idx], captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.CLIENTS, 'put', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.CLIENTS,
+          'put',
+          cache.clients[idx],
+          'UPDATE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.CLIENTS, 'put', err, captureContext);
+        });
+    } else {
+      this.engine.put(V2_STORES.CLIENTS, cache.clients[idx], captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.CLIENTS, 'put', err, captureContext);
+      });
+    }
 
     return note;
   }
@@ -737,6 +968,7 @@ export class StorageServiceAdapter {
     const idx = cache.clients.findIndex((c) => c.id === clientId);
     if (idx === -1) return null;
 
+    const baseVersion = (cache.clients[idx] as any).version || 1;
     const newInteraction: ClientInteraction = {
       ...interaction,
       id: `ci-${Date.now()}`,
@@ -746,9 +978,24 @@ export class StorageServiceAdapter {
     cache.clients[idx].lastInteraction = interaction.date;
 
     const captureContext = this.currentContext;
-    this.engine.put(V2_STORES.CLIENTS, cache.clients[idx], captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.CLIENTS, 'put', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.CLIENTS,
+          'put',
+          cache.clients[idx],
+          'UPDATE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.CLIENTS, 'put', err, captureContext);
+        });
+    } else {
+      this.engine.put(V2_STORES.CLIENTS, cache.clients[idx], captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.CLIENTS, 'put', err, captureContext);
+      });
+    }
 
     return newInteraction;
   }
@@ -775,16 +1022,22 @@ export class StorageServiceAdapter {
     const now = new Date().toISOString().replace('T', ' ').substring(0, 16);
 
     let saved: Transaction;
+    let isCreate = false;
+    let baseVersion = 1;
+
     if (tx.id) {
       const idx = cache.transactions.findIndex((t) => t.id === tx.id);
       if (idx !== -1) {
+        baseVersion = (cache.transactions[idx] as any).version || 1;
         saved = { ...cache.transactions[idx], ...tx };
         cache.transactions[idx] = saved;
       } else {
+        isCreate = true;
         saved = { ...tx, id: tx.id, createdAt: now } as Transaction;
         cache.transactions.unshift(saved);
       }
     } else {
+      isCreate = true;
       const id = typeof crypto !== 'undefined' && crypto.randomUUID
         ? crypto.randomUUID()
         : `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
@@ -798,21 +1051,53 @@ export class StorageServiceAdapter {
     }
 
     const captureContext = this.currentContext;
-    this.engine.put(V2_STORES.TRANSACTIONS, saved, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.TRANSACTIONS, 'put', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.TRANSACTIONS,
+          'put',
+          saved,
+          isCreate ? 'CREATE' : 'UPDATE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.TRANSACTIONS, 'put', err, captureContext);
+        });
+    } else {
+      this.engine.put(V2_STORES.TRANSACTIONS, saved, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.TRANSACTIONS, 'put', err, captureContext);
+      });
+    }
 
     return saved;
   }
 
   public deleteTransaction(txId: string): void {
     const cache = this.getActiveWorkspaceCache();
+    const existing = cache.transactions.find((t) => t.id === txId);
+    const baseVersion = (existing as any)?.version || 1;
     cache.transactions = cache.transactions.filter((t) => t.id !== txId);
 
     const captureContext = this.currentContext;
-    this.engine.delete(V2_STORES.TRANSACTIONS, txId, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.TRANSACTIONS, 'delete', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.TRANSACTIONS,
+          'delete',
+          { id: txId },
+          'DELETE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.TRANSACTIONS, 'delete', err, captureContext);
+        });
+    } else {
+      this.engine.delete(V2_STORES.TRANSACTIONS, txId, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.TRANSACTIONS, 'delete', err, captureContext);
+      });
+    }
   }
 
   // --- Strategy Module ---
@@ -824,12 +1109,28 @@ export class StorageServiceAdapter {
 
   public saveStrategyMission(mission: TeamMission): TeamMission {
     const cache = this.getActiveWorkspaceCache();
+    const baseVersion = (cache.mission as any)?.version || 1;
     cache.mission = mission;
 
     const captureContext = this.currentContext;
-    this.engine.put(V2_STORES.MISSION, { ...mission, id: 'current' }, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.MISSION, 'put', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.MISSION,
+          'put',
+          { ...mission, id: 'current' },
+          'UPDATE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.MISSION, 'put', err, captureContext);
+        });
+    } else {
+      this.engine.put(V2_STORES.MISSION, { ...mission, id: 'current' }, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.MISSION, 'put', err, captureContext);
+      });
+    }
 
     return mission;
   }
@@ -841,12 +1142,28 @@ export class StorageServiceAdapter {
 
   public saveStrategyVision(vision: TeamVision): TeamVision {
     const cache = this.getActiveWorkspaceCache();
+    const baseVersion = (cache.vision as any)?.version || 1;
     cache.vision = vision;
 
     const captureContext = this.currentContext;
-    this.engine.put(V2_STORES.VISION, { ...vision, id: 'current' }, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.VISION, 'put', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.VISION,
+          'put',
+          { ...vision, id: 'current' },
+          'UPDATE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.VISION, 'put', err, captureContext);
+        });
+    } else {
+      this.engine.put(V2_STORES.VISION, { ...vision, id: 'current' }, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.VISION, 'put', err, captureContext);
+      });
+    }
 
     return vision;
   }
@@ -863,16 +1180,22 @@ export class StorageServiceAdapter {
     const now = new Date().toISOString().replace('T', ' ').substring(0, 16);
 
     let saved: StrategicGoal;
+    let isCreate = false;
+    let baseVersion = 1;
+
     if (goal.id) {
       const idx = cache.goals.findIndex((g) => g.id === goal.id);
       if (idx !== -1) {
+        baseVersion = (cache.goals[idx] as any).version || 1;
         saved = { ...cache.goals[idx], ...goal, updatedAt: now };
         cache.goals[idx] = saved;
       } else {
+        isCreate = true;
         saved = { ...goal, id: goal.id, createdAt: now, updatedAt: now } as StrategicGoal;
         cache.goals.unshift(saved);
       }
     } else {
+      isCreate = true;
       const id = typeof crypto !== 'undefined' && crypto.randomUUID
         ? crypto.randomUUID()
         : `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
@@ -887,21 +1210,53 @@ export class StorageServiceAdapter {
     }
 
     const captureContext = this.currentContext;
-    this.engine.put(V2_STORES.GOALS, saved, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.GOALS, 'put', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.GOALS,
+          'put',
+          saved,
+          isCreate ? 'CREATE' : 'UPDATE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.GOALS, 'put', err, captureContext);
+        });
+    } else {
+      this.engine.put(V2_STORES.GOALS, saved, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.GOALS, 'put', err, captureContext);
+      });
+    }
 
     return saved;
   }
 
   public deleteStrategicGoal(goalId: string): void {
     const cache = this.getActiveWorkspaceCache();
+    const existing = cache.goals.find((g) => g.id === goalId);
+    const baseVersion = (existing as any)?.version || 1;
     cache.goals = cache.goals.filter((g) => g.id !== goalId);
 
     const captureContext = this.currentContext;
-    this.engine.delete(V2_STORES.GOALS, goalId, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.GOALS, 'delete', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.GOALS,
+          'delete',
+          { id: goalId },
+          'DELETE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.GOALS, 'delete', err, captureContext);
+        });
+    } else {
+      this.engine.delete(V2_STORES.GOALS, goalId, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.GOALS, 'delete', err, captureContext);
+      });
+    }
   }
 
   public getStrategicPriorities(): StrategicPriority[] {
@@ -914,17 +1269,22 @@ export class StorageServiceAdapter {
   ): StrategicPriority {
     const cache = this.getActiveWorkspaceCache();
     let saved: StrategicPriority;
+    let isCreate = false;
+    let baseVersion = 1;
 
     if (priority.id) {
       const idx = cache.priorities.findIndex((p) => p.id === priority.id);
       if (idx !== -1) {
+        baseVersion = (cache.priorities[idx] as any).version || 1;
         saved = { ...cache.priorities[idx], ...priority };
         cache.priorities[idx] = saved;
       } else {
+        isCreate = true;
         saved = { ...priority, id: priority.id, order: cache.priorities.length + 1 } as StrategicPriority;
         cache.priorities.push(saved);
       }
     } else {
+      isCreate = true;
       const id = typeof crypto !== 'undefined' && crypto.randomUUID
         ? crypto.randomUUID()
         : `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
@@ -938,21 +1298,53 @@ export class StorageServiceAdapter {
     }
 
     const captureContext = this.currentContext;
-    this.engine.put(V2_STORES.PRIORITIES, saved, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.PRIORITIES, 'put', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.PRIORITIES,
+          'put',
+          saved,
+          isCreate ? 'CREATE' : 'UPDATE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.PRIORITIES, 'put', err, captureContext);
+        });
+    } else {
+      this.engine.put(V2_STORES.PRIORITIES, saved, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.PRIORITIES, 'put', err, captureContext);
+      });
+    }
 
     return saved;
   }
 
   public deleteStrategicPriority(priorityId: string): void {
     const cache = this.getActiveWorkspaceCache();
+    const existing = cache.priorities.find((p) => p.id === priorityId);
+    const baseVersion = (existing as any)?.version || 1;
     cache.priorities = cache.priorities.filter((p) => p.id !== priorityId);
 
     const captureContext = this.currentContext;
-    this.engine.delete(V2_STORES.PRIORITIES, priorityId, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.PRIORITIES, 'delete', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.PRIORITIES,
+          'delete',
+          { id: priorityId },
+          'DELETE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.PRIORITIES, 'delete', err, captureContext);
+        });
+    } else {
+      this.engine.delete(V2_STORES.PRIORITIES, priorityId, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.PRIORITIES, 'delete', err, captureContext);
+      });
+    }
   }
 
   public getDevelopmentPlan(): DevelopmentPlanItem[] {
@@ -965,17 +1357,22 @@ export class StorageServiceAdapter {
   ): DevelopmentPlanItem {
     const cache = this.getActiveWorkspaceCache();
     let saved: DevelopmentPlanItem;
+    let isCreate = false;
+    let baseVersion = 1;
 
     if (item.id) {
       const idx = cache.plan.findIndex((p) => p.id === item.id);
       if (idx !== -1) {
+        baseVersion = (cache.plan[idx] as any).version || 1;
         saved = { ...cache.plan[idx], ...item };
         cache.plan[idx] = saved;
       } else {
+        isCreate = true;
         saved = { ...item, id: item.id, order: cache.plan.length + 1 } as DevelopmentPlanItem;
         cache.plan.push(saved);
       }
     } else {
+      isCreate = true;
       const id = typeof crypto !== 'undefined' && crypto.randomUUID
         ? crypto.randomUUID()
         : `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
@@ -989,21 +1386,53 @@ export class StorageServiceAdapter {
     }
 
     const captureContext = this.currentContext;
-    this.engine.put(V2_STORES.PLANS, saved, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.PLANS, 'put', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.PLANS,
+          'put',
+          saved,
+          isCreate ? 'CREATE' : 'UPDATE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.PLANS, 'put', err, captureContext);
+        });
+    } else {
+      this.engine.put(V2_STORES.PLANS, saved, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.PLANS, 'put', err, captureContext);
+      });
+    }
 
     return saved;
   }
 
   public deleteDevelopmentPlanItem(itemId: string): void {
     const cache = this.getActiveWorkspaceCache();
+    const existing = cache.plan.find((p) => p.id === itemId);
+    const baseVersion = (existing as any)?.version || 1;
     cache.plan = cache.plan.filter((p) => p.id !== itemId);
 
     const captureContext = this.currentContext;
-    this.engine.delete(V2_STORES.PLANS, itemId, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.PLANS, 'delete', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.PLANS,
+          'delete',
+          { id: itemId },
+          'DELETE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.PLANS, 'delete', err, captureContext);
+        });
+    } else {
+      this.engine.delete(V2_STORES.PLANS, itemId, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.PLANS, 'delete', err, captureContext);
+      });
+    }
   }
 
   // --- Settings ---
@@ -1015,6 +1444,7 @@ export class StorageServiceAdapter {
 
   public updateSettings(settings: Partial<WorkspaceSettings>): WorkspaceSettings {
     const cache = this.getActiveWorkspaceCache();
+    const baseVersion = (cache.settings as any)?.version || 1;
     const updated: WorkspaceSettings = {
       ...cache.settings,
       ...settings,
@@ -1022,9 +1452,24 @@ export class StorageServiceAdapter {
     cache.settings = updated;
 
     const captureContext = this.currentContext;
-    this.engine.put(V2_STORES.SETTINGS, { id: 'current', ...updated }, captureContext).catch((err) => {
-      this.emitPersistenceError(V2_STORES.SETTINGS, 'put', err, captureContext);
-    });
+    if (captureContext.workspaceId) {
+      this.engine
+        .mutateAndEnqueueOutbox(
+          V2_STORES.SETTINGS,
+          'put',
+          { id: 'current', ...updated },
+          'UPDATE',
+          baseVersion,
+          captureContext
+        )
+        .catch((err) => {
+          this.emitPersistenceError(V2_STORES.SETTINGS, 'put', err, captureContext);
+        });
+    } else {
+      this.engine.put(V2_STORES.SETTINGS, { id: 'current', ...updated }, captureContext).catch((err) => {
+        this.emitPersistenceError(V2_STORES.SETTINGS, 'put', err, captureContext);
+      });
+    }
 
     return updated;
   }
